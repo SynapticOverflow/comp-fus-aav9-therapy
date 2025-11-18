@@ -1,0 +1,23 @@
+numpy
+scipy
+matplotlib
+pandas
+numba
+sympy
+scikit-learn
+jupyter
+tqdm
+
+# PDE/SDE/SPDE modeling
+fenics
+petsc
+mpi4py
+sdeint
+
+# Optimization / sensitivity analysis
+SALib
+
+# Optional but common in research workflows
+seaborn
+pyyaml
+h5py
