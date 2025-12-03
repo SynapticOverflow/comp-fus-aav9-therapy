@@ -1,0 +1,668 @@
+"""
+gm2_gpu_simulator.py
+
+Pediatric multi-region GM2 / therapy simulator
+----------------------------------------------
+- 3D brain compartments: FC, TC, TH, HP, BG, CB
+- AAV–T4 + FUS BBB opening + SP2 substrate-reduction therapy
+- 5 antibodies (IgG1, IgG2, IgG3, IgM, IgA) + complement (C3, C5)
+- 8 immune responses: M1, M2, Astro, Teff, Treg, NK, Mono, Bcell
+- 7 cytokines: TNF, IL1, IL6, IL10, IL4, IFNg, IL17
+- Neuroinflammation with explicit resolution when GM2 is low
+- Hepatotoxicity index
+- GPU-vectorized Milstein SDE, nested Monte Carlo, CI plots
+
+Requirements:
+    pip install torch matplotlib numpy
+"""
+
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+
+# ============================================================
+# Device
+# ============================================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# ============================================================
+# Pediatric skull + BBB physics (for FUS / AAV entry)
+# ============================================================
+
+# ~0.2–0.3 cm infant skull, ~7 dB/cm attenuation at 500–700 kHz
+PED_SKULL_THICKNESS = 0.25  # cm
+PED_SKULL_ATTEN = 7.0       # dB/cm
+BBB_open_base = 1.0 - (PED_SKULL_THICKNESS * PED_SKULL_ATTEN / 20.0)
+BBB_open_base = float(np.clip(BBB_open_base, 0.4, 1.0))  # 0.4–1.0 effective window
+
+# ============================================================
+# 3D pediatric brain geometry & diffusion
+# ============================================================
+
+REGIONS = ["FC", "TC", "TH", "HP", "BG", "CB"]
+R = len(REGIONS)
+
+BRAIN_COORDS = torch.tensor([
+    [ 2.0,  3.0,  3.0],   # FC
+    [ 1.0,  2.0,  2.5],   # TC
+    [ 0.0,  1.0,  3.0],   # TH
+    [-1.0,  0.5,  1.5],   # HP
+    [-0.5,  0.0,  2.5],   # BG
+    [-2.0, -1.0,  2.5],   # CB
+], dtype=torch.float32, device=device)
+
+dists = torch.norm(BRAIN_COORDS[:, None, :] - BRAIN_COORDS[None, :, :], dim=2)
+lambda_conn = 2.5  # cm
+A = torch.exp(-0.5 * (dists / lambda_conn) ** 2)
+A.fill_diagonal_(0.0)
+L = torch.diag(A.sum(dim=1)) - A
+EPS = 1e-8
+
+# ============================================================
+# Base biological parameters (calibrated)
+# ============================================================
+
+# GM2 degradation half-life ~25 d ⇒ k ≈ ln(2)/25
+t_half_GM2 = 25.0
+k_deg_scalar = math.log(2.0) / t_half_GM2  # ≈0.028/d
+
+k_deg_base = torch.tensor([
+    1.1 * k_deg_scalar,   # FC slightly higher turnover
+    1.1 * k_deg_scalar,   # TC
+    1.0 * k_deg_scalar,   # TH
+    0.9 * k_deg_scalar,   # HP
+    0.9 * k_deg_scalar,   # BG
+    0.8 * k_deg_scalar,   # CB
+], device=device)
+
+# Synthesis tuned so baseline GM2_ss ~ 40–60 a.u. in untreated
+k_synth_base = torch.tensor([1.8, 1.7, 1.6, 1.5, 1.4, 1.3], device=device)
+
+# Microglial/astro clearance
+k_phago_base = torch.tensor([0.004, 0.005, 0.006, 0.005, 0.004, 0.004], device=device)
+
+# GM2 diffusion between regions
+D_G_base = torch.tensor(0.006, device=device)
+
+# AAV regional preference (hippocampus/thalamus > cortex)
+AAV_regional = torch.tensor([0.9, 0.9, 1.1, 1.2, 1.0, 0.8], device=device)
+
+# Immune cell kinetics (activity variables)
+k_M1_act   = 0.01;   k_M1_res   = 0.05
+k_M2_fromM1 = 0.02;  k_M2_decay = 0.03
+k_astro_act = 0.01;  k_astro_decay = 0.05
+k_Teff_act = 0.01;   k_Teff_decay = 0.05
+k_Treg_act = 0.008;  k_Treg_decay = 0.04
+k_NK_act   = 0.008;  k_NK_decay = 0.05
+k_Mono_act = 0.01;   k_Mono_decay = 0.05
+k_Bcell_act = 0.008; k_Bcell_decay = 0.04
+
+# Cytokines (arbitrary units but relative weights preserved)
+alpha_TNF  = 0.5; beta_TNF  = 0.5
+alpha_IL1  = 0.2; beta_IL1  = 0.4
+alpha_IL6  = 0.4; beta_IL6  = 0.3
+alpha_IL10 = 0.25; beta_IL10 = 0.4
+alpha_IL4  = 0.2; beta_IL4  = 0.35
+alpha_IFNg = 0.25; beta_IFNg = 0.4
+alpha_IL17 = 0.2; beta_IL17 = 0.4
+
+# Inflammation coupling (self-limiting)
+theta_I   = 0.5
+mu_I      = 0.0
+k_G_to_I  = 0.08
+sigma_I   = 0.5
+
+# GM2 noise
+sigma_G   = 0.2
+
+# Hepatotoxicity
+k_H_from_Ab = 5e-4
+k_H_from_C3 = 1e-3
+k_H_repair  = 2e-3
+sigma_H     = 0.02
+
+# Antibody decay from half-lives
+def k_from_t_half(t_half_days: float) -> float:
+    return math.log(2.0) / t_half_days
+
+k_IgG1_prim = 8e-5;  k_IgG1_decay = k_from_t_half(25.0)   # ≈0.028/d
+k_IgG2_prim = 7e-5;  k_IgG2_decay = k_from_t_half(27.0)
+k_IgG3_prim = 6e-5;  k_IgG3_decay = k_from_t_half(7.0)
+k_IgM_prim  = 5e-4;  k_IgM_decay  = k_from_t_half(5.0)
+k_IgA_prim  = 4e-5;  k_IgA_decay  = k_from_t_half(6.0)
+
+k_C3_from_IgG = 4e-3; k_C3_decay = 0.1
+k_C5_from_C3  = 2e-3; k_C5_decay = 0.12
+
+k_autoIgG_from_I = 1e-3
+k_autoIgG_clear  = 0.03
+
+alpha_I = torch.tensor([0.15, 0.17, 0.18, 0.16, 0.15, 0.15], device=device)
+
+# ============================================================
+# Therapy parameters (AAV-T4, SP2, FUS)
+# ============================================================
+
+# AAV-T4
+T_AAV = 30.0              # injection day
+FUS_sigma = 5.0           # FUS temporal width (days)
+AAV_dose = 1.0            # relative dose scale
+k_AAV_clear = 0.002       # long-lived CNS expression
+sigma_AAV = 0.3
+AAV_EC50 = 0.3            # AAV level for half-max expression
+phi_AAV_deg = 18.0        # at saturation, k_deg ≈ (1+18)=19× baseline
+
+# SP2 / miglustat-like SRT
+T_SP2_start = 0.0
+T_SP2_end   = 365.0       # 1-year course
+SP2_input_base = 1.5
+k_SP2_elim  = 0.02
+sigma_SP2  = 0.15
+SP2_EC50   = 0.7
+eta_SP2_max = 0.90        # up to 90% synthesis inhibition
+
+# FUS OU noise modulating BBB
+k_FUS_ou   = 1.0
+sigma_FUS  = 0.4
+
+# ============================================================
+# Milstein helpers (correct torch.normal usage)
+# ============================================================
+
+def milstein_vec(x: torch.Tensor,
+                 drift: torch.Tensor,
+                 sigma: float,
+                 dt: float,
+                 rng: torch.Generator) -> torch.Tensor:
+    """
+    Vector Milstein for multiplicative noise g(x) = sigma * sqrt(x)
+    Applies element-wise to x and drift.
+    """
+    x = torch.clamp(x, min=0.0)
+    sqrtx = torch.sqrt(torch.clamp(x, min=EPS))
+    g = sigma * sqrtx
+    gprime = 0.5 * sigma / torch.clamp(sqrtx, min=EPS)
+
+    dW = torch.normal(
+        mean=0.0,
+        std=torch.sqrt(torch.tensor(dt, device=device)),
+        size=x.shape,
+        generator=rng,
+        device=device
+    )
+    dW2 = dW * dW - dt
+
+    x_new = x + drift * dt + g * dW + 0.5 * g * gprime * dW2
+    return torch.clamp(x_new, min=0.0)
+
+
+def milstein_scalar_vec(x: torch.Tensor,
+                        drift: torch.Tensor,
+                        sigma: float,
+                        dt: float,
+                        rng: torch.Generator) -> torch.Tensor:
+    """
+    Same as milstein_vec but intended for 1D state vectors.
+    """
+    x = torch.clamp(x, min=0.0)
+    sqrtx = torch.sqrt(torch.clamp(x, min=EPS))
+    g = sigma * sqrtx
+    gprime = 0.5 * sigma / torch.clamp(sqrtx, min=EPS)
+
+    dW = torch.normal(
+        mean=0.0,
+        std=torch.sqrt(torch.tensor(dt, device=device)),
+        size=x.shape,
+        generator=rng,
+        device=device
+    )
+    dW2 = dW * dW - dt
+
+    x_new = x + drift * dt + g * dW + 0.5 * g * gprime * dW2
+    return torch.clamp(x_new, min=0.0)
+
+# ============================================================
+# Inflammation and GM2 drifts
+# ============================================================
+
+def composite_inflammation(TNF, IL1, IL6, IL10, IL4, IFNg, IL17):
+    pro  = TNF + IL1 + IL6 + IFNg + IL17
+    anti = IL10 + IL4
+    return pro - 0.7 * anti
+
+
+def drift_I(I, G, TNF, IL1, IL6, IL10, IL4, IFNg, IL17):
+    """
+    Resolution-aware inflammation drift:
+    - Early: GM2 + cytokines drive I upward.
+    - Late: once GM2 falls below a threshold, strong negative drift collapses I.
+    """
+    raw      = composite_inflammation(TNF, IL1, IL6, IL10, IL4, IFNg, IL17)
+    raw_pos  = torch.clamp(raw, min=0.0)
+    pro_drive = raw_pos / (1.0 + 0.3 * raw_pos)  # saturating
+
+    G_ref = 8.0  # "pathologic" GM2 level
+    gm2_excess = torch.clamp(G - G_ref, min=0.0)
+    gm2_drive  = k_G_to_I * gm2_excess          # only high GM2 drives I up
+
+    gm2_below = torch.clamp(G_ref - G, min=0.0)
+    resolution = -0.4 * gm2_below * I          # strong decay when GM2 low
+
+    exhaustion = -0.25 * I**2                  # microglial exhaustion
+    stress     = -0.02 * G * I                 # mild negative coupling
+
+    return (
+        theta_I * (mu_I - I)   # mean reversion
+        + 0.01 * pro_drive     # modest cytokine drive
+        + gm2_drive
+        + resolution
+        + exhaustion
+        + stress
+    )
+
+
+def drift_G(G,
+            I,
+            k_synth_eff,
+            k_deg_eff,
+            k_phago_paths,
+            D_G_paths,
+            autoIgG,
+            L):
+    """
+    GM2 drift per region, per path.
+    """
+    synth = k_synth_eff * (1.0 + alpha_I * I + 0.05 * autoIgG)
+    synth = torch.clamp(synth, 0.0, 8.0)
+    clearance = (k_deg_eff + k_phago_paths) * G
+    diffusion = torch.matmul(G, L.T) * D_G_paths
+    return synth - clearance - diffusion
+
+# ============================================================
+# Therapy envelopes (deterministic parts)
+# ============================================================
+
+def fus_gaussian(t: float) -> float:
+    return float(np.exp(-0.5 * ((t - T_AAV) / FUS_sigma)**2))
+
+
+def sp2_input(t: float) -> float:
+    if t < T_SP2_start or t > T_SP2_end:
+        return 0.0
+    return SP2_input_base
+
+# ============================================================
+# GPU Monte Carlo simulator
+# ============================================================
+
+def simulate_gpu(T_days: float = 365.0,
+                 dt: float = 0.1,
+                 n_paths: int = 300,
+                 seed: int = 2026):
+    """
+    Main simulation routine.
+
+    Returns:
+        t_grid      : (n_steps,) time array
+        G_traj      : (n_steps, n_paths, R) GM2 per region
+        I_traj      : (n_steps, n_paths, R) inflammation per region
+        H_traj      : (n_steps, n_paths)   hepatotoxicity
+        IgGtot_traj : (n_steps, n_paths)   total systemic IgG
+        AAV_traj    : (n_steps, n_paths, R) AAV load per region
+        SP2_traj    : (n_steps, n_paths)   SP2 concentration
+    """
+    torch.manual_seed(seed)
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed + 1)
+
+    n_steps = int(T_days / dt) + 1
+    t_grid = torch.linspace(0.0, T_days, n_steps, device=device)
+
+    # parameter uncertainty per path
+    s_synth = torch.empty((n_paths, 1), device=device).uniform_(0.9, 1.1)
+    s_deg   = torch.empty((n_paths, 1), device=device).uniform_(0.9, 1.1)
+    s_phago = torch.empty((n_paths, 1), device=device).uniform_(0.9, 1.1)
+    s_diff  = torch.empty((n_paths, 1), device=device).uniform_(0.8, 1.2)
+
+    k_synth_paths_base = s_synth * k_synth_base.view(1, R)
+    k_deg_paths_base   = s_deg   * k_deg_base.view(1, R)
+    k_phago_paths      = s_phago * k_phago_base.view(1, R)
+    D_G_paths          = s_diff  * D_G_base  # (N,1)
+
+    # trajectories
+    G_traj      = torch.zeros((n_steps, n_paths, R), device=device)
+    I_traj      = torch.zeros((n_steps, n_paths, R), device=device)
+    H_traj      = torch.zeros((n_steps, n_paths), device=device)
+    IgGtot_traj = torch.zeros((n_steps, n_paths), device=device)
+    AAV_traj    = torch.zeros((n_steps, n_paths, R), device=device)
+    SP2_traj    = torch.zeros((n_steps, n_paths), device=device)
+
+    N = n_paths
+
+    # initial conditions (natural history)
+    G = torch.tensor([10.0, 9.0, 11.0, 8.0, 7.0, 6.0], device=device).view(1, R).repeat(N, 1)
+    I = torch.full((N, R), 0.2, device=device)
+
+    M1    = torch.full((N, R), 0.1, device=device)
+    M2    = torch.full((N, R), 0.05, device=device)
+    Astro = torch.full((N, R), 0.05, device=device)
+    Teff  = torch.full((N, R), 0.05, device=device)
+    Treg  = torch.full((N, R), 0.05, device=device)
+    NK    = torch.full((N, R), 0.05, device=device)
+    Mono  = torch.full((N, R), 0.05, device=device)
+    Bcell = torch.full((N, R), 0.05, device=device)
+
+    TNF  = torch.full((N, R), 0.05, device=device)
+    IL1  = torch.full((N, R), 0.03, device=device)
+    IL6  = torch.full((N, R), 0.04, device=device)
+    IL10 = torch.full((N, R), 0.03, device=device)
+    IL4  = torch.full((N, R), 0.03, device=device)
+    IFNg = torch.full((N, R), 0.03, device=device)
+    IL17 = torch.full((N, R), 0.03, device=device)
+
+    autoIgG = torch.zeros((N, R), device=device)
+
+    IgG1 = torch.zeros(N, device=device)
+    IgG2 = torch.zeros(N, device=device)
+    IgG3 = torch.zeros(N, device=device)
+    IgM  = torch.zeros(N, device=device)
+    IgA  = torch.zeros(N, device=device)
+    C3   = torch.zeros(N, device=device)
+    C5   = torch.zeros(N, device=device)
+    H    = torch.zeros(N, device=device)
+
+    # stochastic therapy states
+    AAV_load = torch.zeros((N, R), device=device)
+    SP2_conc = torch.zeros((N, 1), device=device)
+    FUS_ou   = torch.zeros((N, 1), device=device)
+
+    # store initial
+    G_traj[0]      = G
+    I_traj[0]      = I
+    H_traj[0]      = H
+    IgGtot_traj[0] = IgG1 + IgG2 + IgG3
+    AAV_traj[0]    = AAV_load
+    SP2_traj[0]    = SP2_conc.squeeze(1)
+
+    for k in range(n_steps - 1):
+        tk = float(t_grid[k].item())
+
+        # ---- deterministic therapy envelopes ----
+        fus_det = fus_gaussian(tk) * BBB_open_base
+        sp2_in  = sp2_input(tk)
+
+        # ---- FUS OU noise → per-path BBB modulation ----
+        dW_fus = torch.normal(
+            mean=0.0,
+            std=torch.sqrt(torch.tensor(dt, device=device)),
+            size=(N, 1),
+            generator=rng,
+            device=device
+        )
+        FUS_ou = FUS_ou + (-k_FUS_ou * FUS_ou) * dt + sigma_FUS * dW_fus
+        bbb_noise_factor = torch.clamp(1.0 + FUS_ou, 0.2, 2.0)
+
+        # ---- AAV-T4 load per region (stochastic) ----
+        dose_term = (
+            AAV_dose * fus_det * bbb_noise_factor *
+            AAV_regional.view(1, R)
+        )
+
+        AAV_drift = dose_term - k_AAV_clear * AAV_load
+        AAV_load = milstein_vec(AAV_load, AAV_drift, sigma_AAV, dt, rng)
+
+        hex_expr   = AAV_load / (AAV_EC50 + AAV_load)
+        k_deg_eff  = k_deg_paths_base * (1.0 + phi_AAV_deg * hex_expr)
+
+        # ---- SP2 concentration (stochastic) ----
+        SP2_input_term = sp2_in * torch.ones((N, 1), device=device)
+        SP2_drift      = SP2_input_term - k_SP2_elim * SP2_conc
+        SP2_conc       = milstein_vec(SP2_conc, SP2_drift, sigma_SP2, dt, rng)
+
+        SP2_scalar = SP2_conc.squeeze(1)
+        inhib_frac = eta_SP2_max * SP2_scalar / (SP2_EC50 + SP2_scalar)
+        inhib_frac = torch.clamp(inhib_frac, 0.0, eta_SP2_max)
+        k_synth_eff = k_synth_paths_base * (1.0 - inhib_frac.view(N, 1))
+        k_synth_eff = torch.clamp(k_synth_eff, min=0.0)
+
+        # ---- antigen for Ab priming ----
+        G_mean_paths = G.mean(dim=1)
+        antigen = torch.where(
+            torch.tensor(tk < 120.0, device=device),
+            G_mean_paths,
+            0.3 * G_mean_paths
+        )
+
+        # ---- inflammation ----
+        I_drift = drift_I(I, G, TNF, IL1, IL6, IL10, IL4, IFNg, IL17)
+        I       = milstein_vec(I, I_drift, sigma_I, dt, rng)
+
+        # ---- GM2 ----
+        G_drift = drift_G(G, I, k_synth_eff, k_deg_eff,
+                          k_phago_paths, D_G_paths, autoIgG, L)
+        G       = milstein_vec(G, G_drift, sigma_G, dt, rng)
+
+        # ---- immune cells ----
+        dW_cells = torch.normal(
+            mean=0.0,
+            std=torch.sqrt(torch.tensor(dt, device=device)),
+            size=(8, N, R),
+            generator=rng,
+            device=device
+        )
+        M1    = M1    + (k_M1_act * (G + I) - k_M1_res * M1) * dt + 0.02 * dW_cells[0]
+        M2    = M2    + (k_M2_fromM1 * M1 - k_M2_decay * M2) * dt + 0.02 * dW_cells[1]
+        Astro = Astro + (k_astro_act * (G + TNF) - k_astro_decay * Astro) * dt + 0.02 * dW_cells[2]
+        Teff  = Teff  + (k_Teff_act * (TNF + IL6) - k_Teff_decay * Teff - 0.02 * Treg) * dt + 0.02 * dW_cells[3]
+        Treg  = Treg  + (k_Treg_act * (M2 + IL10) - k_Treg_decay * Treg) * dt + 0.02 * dW_cells[4]
+        NK    = NK    + (k_NK_act * (IFNg + G) - k_NK_decay * NK) * dt + 0.02 * dW_cells[5]
+        Mono  = Mono  + (k_Mono_act * (G + I) - k_Mono_decay * Mono) * dt + 0.02 * dW_cells[6]
+        Bcell = Bcell + (k_Bcell_act * antigen.view(N, 1) - k_Bcell_decay * Bcell) * dt + 0.02 * dW_cells[7]
+        for arr in (M1, M2, Astro, Teff, Treg, NK, Mono, Bcell):
+            arr.clamp_(min=0.0)
+
+        # ---- cytokines ----
+        dW_cyt = torch.normal(
+            mean=0.0,
+            std=torch.sqrt(torch.tensor(dt, device=device)),
+            size=(7, N, R),
+            generator=rng,
+            device=device
+        )
+        TNF_drift  = alpha_TNF  * (M1 + Mono)        - beta_TNF  * TNF
+        IL1_drift  = alpha_IL1  * (M1 * G + Mono)    - beta_IL1  * IL1
+        IL6_drift  = alpha_IL6  * (M1 + IL1 + Astro) - beta_IL6  * IL6
+        IL10_drift = alpha_IL10 * (M2 + Treg)        - beta_IL10 * IL10
+        IL4_drift  = alpha_IL4  * Treg               - beta_IL4  * IL4
+        IFNg_drift = alpha_IFNg * (Teff + NK)        - beta_IFNg * IFNg
+        IL17_drift = alpha_IL17 * (Teff + Mono)      - beta_IL17 * IL17
+
+        TNF  = torch.clamp(TNF  + TNF_drift  * dt + 0.05 * dW_cyt[0], min=0.0)
+        IL1  = torch.clamp(IL1  + IL1_drift  * dt + 0.05 * dW_cyt[1], min=0.0)
+        IL6  = torch.clamp(IL6  + IL6_drift  * dt + 0.05 * dW_cyt[2], min=0.0)
+        IL10 = torch.clamp(IL10 + IL10_drift * dt + 0.05 * dW_cyt[3], min=0.0)
+        IL4  = torch.clamp(IL4  + IL4_drift  * dt + 0.05 * dW_cyt[4], min=0.0)
+        IFNg = torch.clamp(IFNg + IFNg_drift * dt + 0.05 * dW_cyt[5], min=0.0)
+        IL17 = torch.clamp(IL17 + IL17_drift * dt + 0.05 * dW_cyt[6], min=0.0)
+
+        # ---- auto-IgG ----
+        dW_auto = torch.normal(
+            mean=0.0,
+            std=torch.sqrt(torch.tensor(dt, device=device)),
+            size=(N, R),
+            generator=rng,
+            device=device
+        )
+        auto_drift = k_autoIgG_from_I * torch.clamp(I, min=0.0) - k_autoIgG_clear * autoIgG
+        autoIgG    = torch.clamp(autoIgG + auto_drift * dt + 0.02 * dW_auto, min=0.0)
+
+        # ---- systemic Ab + complement ----
+        dW_ab = torch.normal(
+            mean=0.0,
+            std=torch.sqrt(torch.tensor(dt, device=device)),
+            size=(5, N),
+            generator=rng,
+            device=device
+        )
+        B_mean = Bcell.mean(dim=1)
+
+        IgG1_drift = k_IgG1_prim * antigen * B_mean - k_IgG1_decay * IgG1
+        IgG2_drift = k_IgG2_prim * antigen * B_mean - k_IgG2_decay * IgG2
+        IgG3_drift = k_IgG3_prim * antigen * B_mean - k_IgG3_decay * IgG3
+        IgM_drift  = k_IgM_prim  * antigen          - k_IgM_decay  * IgM
+        IgA_drift  = k_IgA_prim  * antigen          - k_IgA_decay  * IgA
+
+        IgG1 = torch.clamp(IgG1 + IgG1_drift * dt + 0.01 * dW_ab[0], min=0.0)
+        IgG2 = torch.clamp(IgG2 + IgG2_drift * dt + 0.01 * dW_ab[1], min=0.0)
+        IgG3 = torch.clamp(IgG3 + IgG3_drift * dt + 0.01 * dW_ab[2], min=0.0)
+        IgM  = torch.clamp(IgM  + IgM_drift  * dt + 0.02 * dW_ab[3], min=0.0)
+        IgA  = torch.clamp(IgA  + IgA_drift  * dt + 0.01 * dW_ab[4], min=0.0)
+
+        IgG_total = IgG1 + IgG2 + IgG3
+
+        C3_drift = k_C3_from_IgG * IgG_total - k_C3_decay * C3
+        C5_drift = k_C5_from_C3  * C3        - k_C5_decay * C5
+
+        C3 = torch.clamp(
+            C3 + C3_drift * dt + 0.01 * torch.normal(
+                mean=0.0,
+                std=torch.sqrt(torch.tensor(dt, device=device)),
+                size=(N,),
+                generator=rng,
+                device=device
+            ),
+            min=0.0
+        )
+        C5 = torch.clamp(
+            C5 + C5_drift * dt + 0.01 * torch.normal(
+                mean=0.0,
+                std=torch.sqrt(torch.tensor(dt, device=device)),
+                size=(N,),
+                generator=rng,
+                device=device
+            ),
+            min=0.0
+        )
+
+        # ---- hepatotoxicity ----
+        Ab_load = IgG_total + 0.5 * IgM + autoIgG.mean(dim=1)
+        H_drift = k_H_from_Ab * Ab_load + k_H_from_C3 * (C3 + 0.5 * C5) - k_H_repair * H
+        H       = milstein_scalar_vec(H, H_drift, sigma_H, dt, rng)
+
+        # store step k+1
+        G_traj[k+1]      = G
+        I_traj[k+1]      = I
+        H_traj[k+1]      = H
+        IgGtot_traj[k+1] = IgG_total
+        AAV_traj[k+1]    = AAV_load
+        SP2_traj[k+1]    = SP2_conc.squeeze(1)
+
+    return (t_grid.cpu().numpy(),
+            G_traj.cpu().numpy(),
+            I_traj.cpu().numpy(),
+            H_traj.cpu().numpy(),
+            IgGtot_traj.cpu().numpy(),
+            AAV_traj.cpu().numpy(),
+            SP2_traj.cpu().numpy())
+
+# ============================================================
+# CI + plotting helpers
+# ============================================================
+
+def summarize_ci(arr, q_low=5.0, q_high=95.0, axis=1):
+    mean = arr.mean(axis=axis)
+    lo   = np.percentile(arr, q_low, axis=axis)
+    hi   = np.percentile(arr, q_high, axis=axis)
+    return mean, lo, hi
+
+
+def plot_ci_region(t, runs_traj, region_idx, title_prefix, ylabel, color="C0"):
+    region_runs = runs_traj[:, :, region_idx]
+    mean, lo, hi = summarize_ci(region_runs, axis=1)
+
+    plt.figure(figsize=(8, 3.5))
+    plt.fill_between(t, lo, hi, alpha=0.3, color=color, label="5–95% CI")
+    plt.plot(t, mean, color=color, linewidth=2.5, label="Mean (Treatment)")
+    plt.title(f"{title_prefix} — {REGIONS[region_idx]}")
+    plt.xlabel("Time (days)")
+    plt.ylabel(ylabel)
+    plt.xlim(t[0], t[-1])
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_ci_scalar(t, runs_traj, title, ylabel, color="C0"):
+    mean, lo, hi = summarize_ci(runs_traj, axis=1)
+
+    plt.figure(figsize=(8, 3.5))
+    plt.fill_between(t, lo, hi, alpha=0.3, color=color, label="5–95% CI")
+    plt.plot(t, mean, color=color, linewidth=2.5, label="Mean (Treatment)")
+    plt.title(title)
+    plt.xlabel("Time (days)")
+    plt.ylabel(ylabel)
+    plt.xlim(t[0], t[-1])
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    # You can change n_paths depending on speed
+    T_days  = 365.0
+    dt      = 0.1
+    n_paths = 400   # e.g. 400 paths; increase for smoother CIs
+
+    (t,
+     G_runs,
+     I_runs,
+     H_runs,
+     IgGtot_runs,
+     AAV_runs,
+     SP2_runs) = simulate_gpu(
+        T_days=T_days,
+        dt=dt,
+        n_paths=n_paths,
+        seed=2026,
+    )
+
+    colors = ["C0", "C1", "C2", "C3", "C4", "C5"]
+
+    # GM2 per region – should peak early then decline and stay low after therapy
+    for r in range(len(REGIONS)):
+        plot_ci_region(
+            t, G_runs, r,
+            title_prefix="GM2 (Therapy: AAV+FUS+SP2)",
+            ylabel="GM2 (a.u.)",
+            color=colors[r % len(colors)]
+        )
+
+    # Neuroinflammation – spike then collapse once GM2 controlled
+    for r in range(len(REGIONS)):
+        plot_ci_region(
+            t, I_runs, r,
+            title_prefix="Neuroinflammation (Post-Therapy)",
+            ylabel="Inflammation (a.u.)",
+            color=colors[r % len(colors)]
+        )
+
+    # Systemic IgG_total (anti-vector) & hepatotoxicity
+    plot_ci_scalar(
+        t, IgGtot_runs,
+        title="Systemic Anti-Vector IgG (Total)",
+        ylabel="IgG_total (a.u.)",
+        color="C1",
+    )
+
+    plot_ci_scalar(
+        t, H_runs,
+        title="Hepatotoxicity Index",
+        ylabel="Hepatotoxicity (a.u.)",
+        color="C3",
+    )
