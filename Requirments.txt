@@ -16,8 +16,3 @@ sdeint
 
 # Optimization / sensitivity analysis
 SALib
-
-# Optional but common in research workflows
-seaborn
-pyyaml
-h5py
