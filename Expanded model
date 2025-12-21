@@ -66,7 +66,7 @@ EPS = 1e-8
 # ============================================================
 
 # GM2 degradation half-life ~25 d ⇒ k ≈ ln(2)/25
-t_half_GM2 = 25.0
+t_half_GM2 = 3.25
 k_deg_scalar = math.log(2.0) / t_half_GM2  # ≈0.028/d
 
 k_deg_base = torch.tensor([
