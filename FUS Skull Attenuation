@@ -1,0 +1,236 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 1. Grid + physical parameters
+# ============================================================
+
+dx = dy = dz = 5e-4              # 0.5 mm
+Nx, Ny, Nz = 64, 64, 96          # 3D grid
+
+# Brain and skull acoustics
+c_brain, rho_brain = 1540.0, 1000.0
+c_skull, rho_skull = 2200.0, 1400.0
+
+# FUS parameters
+f0       = 5e5                   # 500 kHz
+n_cycles = 8
+
+# Skull geometry
+skull_thickness_mm = 3.0
+skull_thickness_m  = skull_thickness_mm * 1e-3
+skull_layers_nom   = int(skull_thickness_m / dz)
+
+skull_curv_mm      = 1.0         # curvature amplitude
+skull_curv_layers  = int(skull_curv_mm * 1e-3 / dz)
+
+sensor_depth_mm = 15.0
+sensor_k = int(sensor_depth_mm * 1e-3 / dz)
+
+# Time step from CFL for k-space / PSTD is fairly generous; we stay safe.
+c_max = max(c_brain, c_skull)
+dt = 5e-8                         # 50 ns
+T0 = 1.0 / f0
+burst_duration = n_cycles*T0
+t_end = 4.0 * burst_duration      # simulate past the burst
+Nt = int(np.round(t_end / dt))
+t = np.arange(Nt)*dt
+
+print(f"Grid: {Nx}x{Ny}x{Nz}, Nt={Nt}, dt={dt*1e9:.1f} ns, t_end={t_end*1e6:.1f} µs")
+
+# ============================================================
+# 2. Source signal: 500 kHz Hann-tapered tone burst
+# ============================================================
+
+omega = 2*np.pi*f0
+source = np.zeros(Nt)
+mask = t <= burst_duration
+source[mask] = np.sin(omega*t[mask])
+s = t[mask]/burst_duration
+hann = 0.5*(1 - np.cos(2*np.pi*s))
+source[mask] *= hann
+
+# ============================================================
+# 3. Medium maps: skull + brain (3D)
+# ============================================================
+
+def build_medium(with_skull=True):
+    c    = np.full((Nz, Ny, Nx), c_brain,   dtype=np.float64)
+    rho  = np.full((Nz, Ny, Nx), rho_brain, dtype=np.float64)
+
+    if with_skull:
+        xs = np.linspace(-1, 1, Nx)
+        ys = np.linspace(-1, 1, Ny)
+        X, Y = np.meshgrid(xs, ys, indexing='xy')
+        R2 = X**2 + Y**2
+        # dome: skull a bit thicker off-axis
+        curvature = skull_curv_layers*(1 - R2)
+        curvature[curvature < 0] = 0.0
+
+        for j in range(Ny):
+            for i in range(Nx):
+                extra = curvature[j, i]
+                z_outer = int(max(0, min(Nz, skull_layers_nom + extra)))
+                if z_outer > 0:
+                    c[:z_outer, j, i]   = c_skull
+                    rho[:z_outer, j, i] = rho_skull
+
+    kappa = rho*c**2
+    return c, rho, kappa
+
+c_sk, rho_sk, kappa_sk = build_medium(with_skull=True)
+c_br, rho_br, kappa_br = build_medium(with_skull=False)
+
+# ============================================================
+# 4. k-space operators (PSTD) + power-law absorption filter
+# ============================================================
+
+# Wavenumber grids
+kx = 2*np.pi*np.fft.fftfreq(Nx, d=dx)
+ky = 2*np.pi*np.fft.fftfreq(Ny, d=dy)
+kz = 2*np.pi*np.fft.fftfreq(Nz, d=dz)
+KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing='xy')
+KX = KX.transpose(2,1,0)   # reshape to (Nz,Ny,Nx)
+KY = KY.transpose(2,1,0)
+KZ = KZ.transpose(2,1,0)
+
+k_mag = np.sqrt(KX**2 + KY**2 + KZ**2) + 1e-12   # avoid 0
+
+def grad_p(p):
+    Pk = np.fft.fftn(p)
+    gx = np.fft.ifftn(1j*KX*Pk).real
+    gy = np.fft.ifftn(1j*KY*Pk).real
+    gz = np.fft.ifftn(1j*KZ*Pk).real
+    return gx, gy, gz
+
+def div_v(vx,vy,vz):
+    Vx = np.fft.fftn(vx)
+    Vy = np.fft.fftn(vy)
+    Vz = np.fft.fftn(vz)
+    div = np.fft.ifftn(1j*KX*Vx + 1j*KY*Vy + 1j*KZ*Vz).real
+    return div
+
+# --- Power-law absorption parameters (Treeby & Cox-like) ---
+# alpha(f) = alpha0 * f^y   (Np/m)  -> we emulate with k-space filter
+alpha0_db_cm_mhz = 0.75     # ~0.75 dB/(cm MHz^y) in skull
+y_exp             = 1.1     # power-law exponent (~1–1.5 typical for bone)
+
+# Convert to SI-ish scale factor at central frequency
+# Very rough; this is for "advanced but still runnable".
+f_ref = f0
+alpha0_np_per_m = (alpha0_db_cm_mhz/8.686) * 100 * (f_ref/1e6)**(y_exp-1)
+
+# Precompute k-space absorption factor per step:
+# |k| ~ 2πf/c, so |k|^y ~ (2πf/c)^y → approximate fractional Laplacian
+c_ref = c_skull
+k_ref = 2*np.pi*f_ref/c_ref
+abs_kernel = (k_mag/k_ref)**y_exp   # dimensionless
+
+# We’ll apply: p_{n+1} ← p_{n+1} * exp(-alpha_eff * abs_kernel * dt)
+alpha_eff = alpha0_np_per_m * c_ref   # fudge to get right order-of-mag
+
+# ============================================================
+# 5. Simple sponge boundary
+# ============================================================
+
+def sponge_mask(Nz,Ny,Nx,th=8, strength=6.0):
+    m = np.ones((Nz,Ny,Nx), dtype=np.float64)
+    for k in range(th):
+        coef = 1 - (k+1)/(th*strength)
+        coef = max(coef,0)
+        m[k,:,:]        *= coef
+        m[-(k+1),:,:]   *= coef
+        m[:,k,:]        *= coef
+        m[:,-(k+1),:]   *= coef
+        m[:,:,k]        *= coef
+        m[:,:,-(k+1)]   *= coef
+    return m
+
+sponge = sponge_mask(Nz,Ny,Nx,th=8,strength=7.0)
+
+# ============================================================
+# 6. Core k-space PSTD time stepper (linear + power-law absorption)
+# ============================================================
+
+def run_kspace(c_map, rho_map, kappa_map, with_skull=True):
+    Nz,Ny,Nx = c_map.shape
+    p  = np.zeros((Nz,Ny,Nx), dtype=np.float64)
+    vx = np.zeros_like(p)
+    vy = np.zeros_like(p)
+    vz = np.zeros_like(p)
+
+    inv_rho = 1.0/rho_map
+    sensor_trace = np.zeros(Nt)
+    j0, i0 = Ny//2, Nx//2
+
+    # FUS aperture radius
+    radius_mm = 8.0
+    r_ap2 = (radius_mm*1e-3)**2
+
+    xs = (np.arange(Nx) - i0)*dx
+    ys = (np.arange(Ny) - j0)*dy
+    Xp, Yp = np.meshgrid(xs, ys, indexing='xy')
+    R2 = Xp**2 + Yp**2
+    ap_mask = (R2 <= r_ap2)
+    gauss = np.exp(-R2/(0.5*r_ap2))
+    gauss[~ap_mask] = 0.0
+
+    for n in range(Nt):
+
+        # velocity update
+        gx,gy,gz = grad_p(p)
+        vx -= dt*inv_rho*gx
+        vy -= dt*inv_rho*gy
+        vz -= dt*inv_rho*gz
+
+        # pressure update
+        divv = div_v(vx,vy,vz)
+        p -= dt*(kappa_map*divv)
+
+        # add source at z=0
+        amp = source[n]
+        p[0,:,:] += amp*gauss
+
+        # k-space power-law absorption (apply in Fourier domain)
+        Pk = np.fft.fftn(p)
+        attenuation_factor = np.exp(-alpha_eff*abs_kernel*dt)
+        Pk *= attenuation_factor
+        p = np.fft.ifftn(Pk).real
+
+        # sponge
+        p  *= sponge
+        vx *= sponge
+        vy *= sponge
+        vz *= sponge
+
+        # record on-axis sensor
+        sensor_trace[n] = p[sensor_k, j0, i0]
+
+    return sensor_trace
+
+print("Running 3D k-space PSTD WITH skull...")
+trace_skull = run_kspace(c_sk, rho_sk, kappa_sk, with_skull=True)
+
+print("Running 3D k-space PSTD WITHOUT skull...")
+trace_no = run_kspace(c_br, rho_br, kappa_br, with_skull=False)
+
+# ============================================================
+# 7. Plot + attenuation estimate
+# ============================================================
+
+time_us = t*1e6
+plt.figure(figsize=(10,5))
+plt.plot(time_us, trace_no,  label="No skull (brain only)")
+plt.plot(time_us, trace_skull, label="With pediatric skull", alpha=0.9)
+plt.xlabel("Time (µs)")
+plt.ylabel("Pressure (arb. units)")
+plt.title(f"3D k-space FUS at {sensor_depth_mm:.1f} mm depth (on-axis)")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+p_no  = np.max(np.abs(trace_no))
+p_sk  = np.max(np.abs(trace_skull))
+ratio = p_sk/p_no
+atten_dB = 20*np.log10(ratio)
+print(f"Peak |p| no skull:   {p_no:.4e}")
+print(f"Peak |p| with skull: {p_sk:.4e}")
+print(f"Estimated skull attenuation at {sensor_depth_mm:.1f} mm: {atten_dB:.2f} dB")
