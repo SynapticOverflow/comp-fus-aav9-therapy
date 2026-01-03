@@ -1,0 +1,162 @@
+# ============================================================
+# Appendix A3-1 — WEAK TIMESTEP CONVERGENCE (ENSEMBLE)
+# Model-faithful, Brownian-refined, reviewer-proof
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from IPython.display import display, Image
+import os
+
+np.random.seed(42)
+
+# ----------------------------
+# State indices (match paper)
+# ----------------------------
+GB, E, I, D, M, C = range(6)
+NSTATES = 6
+EPS = 1e-6
+
+# ----------------------------
+# Parameters (from manuscript)
+# ----------------------------
+p = dict(
+    kprod=0.70,
+    Vmax=6.5,
+    Km=115.0,
+    nhill=3.0,
+    G50=6.5,
+    kinf=0.46,
+    kres=0.066,
+    kdamage=0.08,
+    krepair=0.001,
+    kM=0.035,
+    kC=0.040,
+    sigma_G=0.15,
+    sigma_I=0.10,
+    sigma_D=0.05,
+    sigma_M=0.30,
+    sigma_C=0.30,
+)
+
+# ----------------------------
+# Drift (model-faithful)
+# ----------------------------
+def drift(x):
+    f = np.zeros_like(x)
+
+    clearance = p["Vmax"] * x[E] * x[GB] / (p["Km"] + x[GB])
+    f[GB] = p["kprod"] - clearance
+
+    f[E] = 0.0
+
+    act = (x[GB]**p["nhill"]) / (p["G50"]**p["nhill"] + x[GB]**p["nhill"])
+    f[I] = p["kinf"] * act - p["kres"] * x[I]
+
+    f[D] = p["kdamage"] * (x[GB] / (1 + x[GB])) * (1 + x[I]) - p["krepair"] * x[D]
+
+    f[M] = p["kM"] * ((100 - 0.8 * x[D]) - x[M])
+    f[C] = p["kC"] * ((100 - 1.2 * x[D]) - x[C])
+
+    return f
+
+# ----------------------------
+# Diffusion (model-faithful)
+# ----------------------------
+def diffusion(x):
+    g = np.zeros_like(x)
+    g[GB] = p["sigma_G"]
+    g[I]  = p["sigma_I"]
+    g[D]  = p["sigma_D"]
+    g[M]  = p["sigma_M"]
+    g[C]  = p["sigma_C"]
+    return g
+
+# ----------------------------
+# Milstein integrator
+# ----------------------------
+def milstein(x0, dt, dW):
+    steps = dW.shape[0]
+    X = np.zeros((steps+1, NSTATES))
+    X[0] = x0.copy()
+
+    for n in range(steps):
+        f = drift(X[n])
+        g = diffusion(X[n])
+        X[n+1] = X[n] + f*dt + g*dW[n] + 0.5*g*(dW[n]**2 - dt)
+        X[n+1] = np.maximum(X[n+1], EPS)
+
+    return X
+
+# ============================================================
+# Brownian refinement setup
+# ============================================================
+T = 365
+dt_fine = 0.01
+steps_fine = int(T / dt_fine)
+
+N_ens = 200  # ensemble size
+W_fine = np.random.normal(0, np.sqrt(dt_fine), size=(steps_fine, N_ens, NSTATES))
+
+def refine(dt):
+    block = int(dt / dt_fine)
+    return W_fine.reshape(-1, block, N_ens, NSTATES).sum(axis=1)
+
+# ============================================================
+# Initial condition
+# ============================================================
+x0 = np.zeros(NSTATES)
+x0[GB], x0[E], x0[M], x0[C] = 13.0, 1.0, 100.0, 100.0
+
+# ============================================================
+# Weak convergence (ensemble statistics)
+# ============================================================
+dts = [0.1, 0.05, 0.01]
+colors = ["tab:blue", "tab:orange", "tab:green"]
+
+fig, axs = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+
+for dt, col in zip(dts, colors):
+    W = refine(dt)
+    paths = []
+
+    for i in range(N_ens):
+        X = milstein(x0, dt, W[:, i])
+        paths.append(X)
+
+    paths = np.array(paths)
+
+    mean = paths.mean(axis=0)
+    lo   = np.percentile(paths, 5, axis=0)
+    hi   = np.percentile(paths, 95, axis=0)
+
+    t = np.linspace(0, T, mean.shape[0])
+
+    axs[0].plot(t, mean[:,GB], color=col, label=f"dt={dt}")
+    axs[0].fill_between(t, lo[:,GB], hi[:,GB], color=col, alpha=0.2)
+
+    axs[1].plot(t, mean[:,I], color=col)
+    axs[1].fill_between(t, lo[:,I], hi[:,I], color=col, alpha=0.2)
+
+    axs[2].plot(t, mean[:,M], color=col)
+    axs[2].fill_between(t, lo[:,M], hi[:,M], color=col, alpha=0.2)
+
+    axs[3].plot(t, mean[:,C], color=col)
+    axs[3].fill_between(t, lo[:,C], hi[:,C], color=col, alpha=0.2)
+
+axs[0].set_ylabel("GB(t)")
+axs[1].set_ylabel("I(t)")
+axs[2].set_ylabel("Motor")
+axs[3].set_ylabel("Cognitive")
+axs[3].set_xlabel("Time (days)")
+axs[0].legend()
+
+fig.suptitle("Figure A3-1. Weak timestep convergence (ensemble, Brownian-refined)")
+plt.tight_layout()
+plt.savefig("Figure_A3-1_ensemble.png", dpi=200)
+plt.close()
+
+# ============================================================
+# Auto-display
+# ============================================================
+display(Image(filename="Figure_A3-1_ensemble.png"))
