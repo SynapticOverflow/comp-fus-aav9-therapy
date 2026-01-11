@@ -1,0 +1,68 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----------------------------------------------------
+# INPUT: axial GM2 field from your simulation
+# ----------------------------------------------------
+# G should be a 2D array: GM2 concentration on an axial slice
+# Example placeholder (REMOVE when using real data)
+nx, ny = 200, 200
+x = np.linspace(-1, 1, nx)
+y = np.linspace(-1, 1, ny)
+X, Y = np.meshgrid(x, y)
+G = 0.8*np.exp(-8*(X**2 + Y**2)) + 0.2*np.exp(-40*((X-0.4)**2 + (Y+0.2)**2))
+
+# ----------------------------------------------------
+# MODEL PARAMETERS
+# ----------------------------------------------------
+D = 0.02          # effective GM2 diffusion coefficient (from manuscript scale)
+dx = x[1] - x[0]
+dy = y[1] - y[0]
+
+# ----------------------------------------------------
+# COMPUTE SPATIAL GRADIENTS
+# ----------------------------------------------------
+dGdx, dGdy = np.gradient(G, dx, dy)
+
+# Diffusive flux: J = -D ∇G
+Jx = -D * dGdx
+Jy = -D * dGdy
+
+# Gradient magnitude (for visualization)
+grad_mag = np.sqrt(dGdx**2 + dGdy**2)
+
+# ----------------------------------------------------
+# PLOTTING
+# ----------------------------------------------------
+fig, ax = plt.subplots(figsize=(6, 6))
+
+# Background: GM2 concentration
+im = ax.imshow(
+    G,
+    origin='lower',
+    cmap='inferno',
+    extent=[x.min(), x.max(), y.min(), y.max()]
+)
+
+# Overlay: flux vectors (downsampled for clarity)
+step = 12
+ax.quiver(
+    X[::step, ::step],
+    Y[::step, ::step],
+    Jx[::step, ::step],
+    Jy[::step, ::step],
+    color='cyan',
+    scale=0.3,
+    width=0.003
+)
+
+cbar = plt.colorbar(im, ax=ax, fraction=0.046)
+cbar.set_label("GM2 concentration (normalized)", fontsize=11)
+
+ax.set_title("Spatial GM2 Diffusion Flux on Axial Slice", fontsize=13)
+ax.set_xlabel("x (normalized)")
+ax.set_ylabel("y (normalized)")
+ax.set_aspect("equal")
+
+plt.tight_layout()
+plt.show()
