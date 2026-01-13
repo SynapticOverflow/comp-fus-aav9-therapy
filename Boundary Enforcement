@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+import numpy as np
+
+# ============================================================
+# Configuration
+# ============================================================
+
+N = 1000                  # Monte Carlo realizations
+T = 365                   # days
+dt = 0.1
+n_steps = int(T / dt)
+
+state_dim = 16
+base_seed = 1234
+rng = np.random.default_rng(base_seed)
+
+# ----------------------------
+# State grouping
+# ----------------------------
+# 0–5 : GM2 regions
+# 6   : inflammation
+# 7   : damage
+# 8   : motor score
+# 9   : cognitive score
+biochem_idx = np.array([0, 1, 2, 3, 4, 5, 6, 7])
+clinical_idx = np.array([8, 9])
+
+# Bounds
+lower_bounds = np.zeros(state_dim)
+upper_bounds = np.full(state_dim, np.inf)
+upper_bounds[8] = 100.0
+upper_bounds[9] = 100.0
+
+# Noise
+sigma = 0.15
+
+# ============================================================
+# Simulation with projection statistics
+# ============================================================
+
+def simulate_with_projection_stats():
+    x = np.zeros((N, state_dim))
+
+    # Initial conditions
+    x[:, 0:6] = 1.0
+    x[:, 6]   = 0.2
+    x[:, 7]   = 0.1
+    x[:, 8]   = 50.0
+    x[:, 9]   = 50.0
+
+    # Counters
+    clip_counts = np.zeros(state_dim)
+    total_updates = N * n_steps
+
+    for _ in range(n_steps):
+        # ----------------------------
+        # Drift (abstract but stable)
+        # ----------------------------
+        drift = np.zeros_like(x)
+        drift[:, 0:6] = -0.01 * x[:, 0:6]
+        drift[:, 6]   =  0.02 * np.mean(x[:, 0:6], axis=1)
+        drift[:, 7]   =  0.01 * x[:, 6] - 0.01 * x[:, 7]
+        drift[:, 8]   = -0.03 * x[:, 7]
+        drift[:, 9]   = -0.025 * x[:, 7]
+
+        # ----------------------------
+        # Noise
+        # ----------------------------
+        dW = rng.standard_normal((N, state_dim)) * np.sqrt(dt)
+        diffusion = sigma * x * dW
+
+        # Update (pre-projection)
+        x_new = x + drift * dt + diffusion
+
+        # ----------------------------
+        # Count projection events
+        # ----------------------------
+        below = x_new < lower_bounds
+        above = x_new > upper_bounds
+        violated = below | above
+        clip_counts += violated.sum(axis=0)
+
+        # ----------------------------
+        # Projection
+        # ----------------------------
+        x = np.clip(x_new, lower_bounds, upper_bounds)
+
+    return clip_counts, total_updates
+
+# ============================================================
+# Run analysis
+# ============================================================
+
+clip_counts, total_updates = simulate_with_projection_stats()
+
+# ============================================================
+# Report results
+# ============================================================
+
+def report(indices, label):
+    count = clip_counts[indices].sum()
+    frac = count / (total_updates * len(indices))
+    print(f"{label}:")
+    print(f"  projection events = {int(count)}")
+    print(f"  fraction of updates projected = {frac:.6e}\n")
+
+print("\n=== Projection / Clipping Frequency Analysis ===\n")
+
+report(biochem_idx, "Biochemical / delivery states")
+report(clinical_idx, "Clinical outcome states")
+
+print("Per-state projection fractions:")
+for i in range(state_dim):
+    frac = clip_counts[i] / total_updates
+    print(f"  state {i:02d}: {frac:.6e}")
