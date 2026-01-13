@@ -1,0 +1,94 @@
+import numpy as np
+
+# ============================================================
+# Configuration
+# ============================================================
+
+N = 1000
+T = 365
+dt = 0.1
+n_steps = int(T / dt)
+
+state_dim = 16
+base_seed = 1234
+rng = np.random.default_rng(base_seed)
+
+rho = 0.3
+Sigma_corr = rho * np.ones((state_dim, state_dim)) + (1 - rho) * np.eye(state_dim)
+Sigma_ind  = np.eye(state_dim)
+
+L_corr = np.linalg.cholesky(Sigma_corr)
+L_ind  = np.linalg.cholesky(Sigma_ind)
+
+# ============================================================
+# Vectorized simulator (ALL trajectories at once)
+# ============================================================
+
+def simulate_ensemble(L):
+    # x shape: (N, state_dim)
+    x = np.zeros((N, state_dim))
+
+    # Initial conditions
+    x[:, 0:6] = 1.0
+    x[:, 6]   = 0.2
+    x[:, 7]   = 0.1
+    x[:, 8]   = 50.0
+    x[:, 9]   = 50.0
+
+    sigma = 0.15
+
+    for _ in range(n_steps):
+        # Drift
+        drift = np.zeros_like(x)
+        drift[:, 0:6] = -0.01 * x[:, 0:6]
+        drift[:, 6]   =  0.02 * np.mean(x[:, 0:6], axis=1)
+        drift[:, 7]   =  0.01 * x[:, 6] - 0.01 * x[:, 7]
+        drift[:, 8]   = -0.03 * x[:, 7]
+        drift[:, 9]   = -0.025 * x[:, 7]
+
+        # Correlated noise (vectorized)
+        dW = rng.standard_normal((N, state_dim))
+        dW = dW @ L.T * np.sqrt(dt)
+
+        diffusion = sigma * x * dW
+
+        # Update
+        x += drift * dt + diffusion
+
+        # Projection
+        np.clip(x, 0.0, None, out=x)
+        x[:, 8] = np.clip(x[:, 8], 0, 100)
+        x[:, 9] = np.clip(x[:, 9], 0, 100)
+
+    # Outputs
+    return {
+        "GM2": np.mean(x[:, 0:6], axis=1),
+        "I":   x[:, 6],
+        "M":   x[:, 8],
+        "C":   x[:, 9],
+    }
+
+# ============================================================
+# Run ablation
+# ============================================================
+
+print("Running correlated noise...")
+res_corr = simulate_ensemble(L_corr)
+
+print("Running independent noise...")
+res_ind  = simulate_ensemble(L_ind)
+
+# ============================================================
+# Summary
+# ============================================================
+
+def summarize(arr):
+    return np.mean(arr), np.std(arr), np.percentile(arr, 95)
+
+for key in res_corr:
+    m1, s1, p1 = summarize(res_corr[key])
+    m2, s2, p2 = summarize(res_ind[key])
+
+    print(f"\n{key}")
+    print(f"  correlated   mean={m1:.3f}, std={s1:.3f}, p95={p1:.3f}")
+    print(f"  independent  mean={m2:.3f}, std={s2:.3f}, p95={p2:.3f}")
