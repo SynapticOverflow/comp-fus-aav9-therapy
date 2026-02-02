@@ -1,0 +1,382 @@
+"""
+GM2 Tri-Modal Model — Pathway-Resolved Coupled SDEs
+- Anabolic module: SP² PK (gut -> plasma -> brain) + synthesis inhibition
+- Catabolic module: AAV-T4 delivery/expression -> enzyme activity
+- GM2 metabolism: synthesis - enzymatic clearance (brain + liver)
+- Neuroinflammation cascade: inflammation index + cumulative damage
+
+This is written so you can:
+1) simulate each pathway "independently" (module-only)
+2) simulate the fully coupled system (all modules interlinked)
+
+Author: you (drop into your repo and edit params to match your manuscript)
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else (hi if x > hi else x)
+
+def hill_inhibition(B: float, IC50: float, nH: float) -> float:
+    """Competitive-like inhibitory factor in [0,1], higher B => stronger inhibition."""
+    B = max(B, 0.0)
+    return 1.0 / (1.0 + (B / max(IC50, 1e-12)) ** max(nH, 1e-6))
+
+def mm_clearance(G: float, E: float, Vmax: float, Km: float) -> float:
+    """Michaelis-Menten-like clearance, scaled by effective enzyme E."""
+    G = max(G, 0.0)
+    E = max(E, 0.0)
+    return (Vmax * E) * (G / (Km + G + 1e-12))
+
+
+# ----------------------------
+# Parameters
+# ----------------------------
+@dataclass
+class Params:
+    # time
+    dt: float = 0.01
+    T: float = 40.0
+
+    # ---- Anabolic (SP² PK): A_gut -> P_plasma -> B_brain ----
+    dose_times: tuple = (0.0, 7.0, 14.0, 21.0, 28.0, 35.0)  # example weekly dosing
+    dose_amt: float = 1.0
+    k_abs: float = 0.8
+    k_elim_p: float = 0.3
+    k_bbb_drug: float = 0.2
+    k_elim_b: float = 0.2
+
+    # SP² inhibition of GM2 synthesis
+    IC50: float = 0.5
+    nH: float = 2.0
+
+    # ---- Catabolic (AAV-T4): T_sys -> T_entry -> E_expr ----
+    aav_bolus_time: float = 0.0
+    aav_bolus_amt: float = 1.0
+    k_clear_sys: float = 0.15
+    k_bbb_vec: float = 0.05
+    k_clear_entry: float = 0.10
+    k_expr: float = 0.30
+    E_max: float = 2.0
+    k_decay_E: float = 0.03
+
+    # ---- FUS gating (multiplicative BBB boost) ----
+    fus_windows: tuple = ((0.5, 0.7), (7.5, 7.7), (14.5, 14.7))  # (start,end) in days
+    fus_boost_drug: float = 3.0   # multiplies k_bbb_drug when on
+    fus_boost_vec: float = 5.0    # multiplies k_bbb_vec when on
+
+    # ---- GM2 metabolism (brain + liver) ----
+    # brain synthesis baseline + catabolic clearance
+    k_syn_brain: float = 0.25
+    Vmax_brain: float = 0.8
+    Km_brain: float = 0.5
+
+    # liver synthesis + clearance (optional, kept simple)
+    k_syn_liver: float = 0.15
+    Vmax_liver: float = 1.2
+    Km_liver: float = 0.6
+
+    # ---- Neuroinflammation cascade ----
+    G_thresh: float = 1.0
+    k_inflam_on: float = 0.35
+    k_resolve: float = 0.20
+    k_damage_G: float = 0.02
+    k_damage_I: float = 0.05
+
+    # ---- Noise (SDE diffusion scales) ----
+    # (Set these to match your manuscript’s stochasticity)
+    sigma_pk: float = 0.03
+    sigma_aav: float = 0.03
+    sigma_gm2: float = 0.04
+    sigma_inflam: float = 0.03
+    sigma_damage: float = 0.01
+
+
+# ----------------------------
+# FUS gate
+# ----------------------------
+def fus_on(t: float, p: Params) -> bool:
+    for (a, b) in p.fus_windows:
+        if a <= t <= b:
+            return True
+    return False
+
+def k_bbb_drug_eff(t: float, p: Params) -> float:
+    return p.k_bbb_drug * (p.fus_boost_drug if fus_on(t, p) else 1.0)
+
+def k_bbb_vec_eff(t: float, p: Params) -> float:
+    return p.k_bbb_vec * (p.fus_boost_vec if fus_on(t, p) else 1.0)
+
+
+# ----------------------------
+# Module drift + diffusion
+# ----------------------------
+def drift_anabolic(x, t, p: Params):
+    # x: [A_gut, P, B]
+    A, Ppl, B = x
+    # dosing impulse
+    dA = -p.k_abs * A
+    dP = p.k_abs * A - p.k_elim_p * Ppl - k_bbb_drug_eff(t, p) * Ppl
+    dB = k_bbb_drug_eff(t, p) * Ppl - p.k_elim_b * B
+    return np.array([dA, dP, dB], dtype=float)
+
+def diffuse_anabolic(x, t, p: Params):
+    # independent noise per state (diagonal diffusion)
+    return p.sigma_pk * np.ones(3, dtype=float)
+
+def drift_catabolic(x, t, p: Params):
+    # x: [T_sys, T_entry, E_expr]
+    Tsys, Tentry, E = x
+    dTsys = -p.k_clear_sys * Tsys - k_bbb_vec_eff(t, p) * Tsys
+    dTentry = k_bbb_vec_eff(t, p) * Tsys - p.k_clear_entry * Tentry
+    # saturating expression toward E_max driven by Tentry, plus decay
+    drive = p.k_expr * Tentry * (1.0 - E / max(p.E_max, 1e-12))
+    dE = drive - p.k_decay_E * E
+    return np.array([dTsys, dTentry, dE], dtype=float)
+
+def diffuse_catabolic(x, t, p: Params):
+    return p.sigma_aav * np.ones(3, dtype=float)
+
+def drift_gm2(x, t, p: Params, B: float, E: float):
+    # x: [G_brain, G_liver]
+    Gb, Gl = x
+    inh = hill_inhibition(B, p.IC50, p.nH)  # multiplies synthesis (lower => less synthesis)
+    # synthesis terms
+    syn_b = p.k_syn_brain * inh
+    syn_l = p.k_syn_liver  # (you can also inhibit liver if you want)
+    # clearance terms
+    clr_b = mm_clearance(Gb, E, p.Vmax_brain, p.Km_brain)
+    clr_l = mm_clearance(Gl, E, p.Vmax_liver, p.Km_liver)  # simplified coupling
+    dGb = syn_b - clr_b
+    dGl = syn_l - clr_l
+    return np.array([dGb, dGl], dtype=float)
+
+def diffuse_gm2(x, t, p: Params):
+    return p.sigma_gm2 * np.ones(2, dtype=float)
+
+def drift_inflammation(x, t, p: Params, Gb: float):
+    # x: [I, D]
+    I, D = x
+    # thresholded activation from GM2 burden
+    trigger = max(Gb - p.G_thresh, 0.0)
+    dI = p.k_inflam_on * trigger - p.k_resolve * I
+    dD = p.k_damage_G * Gb + p.k_damage_I * I
+    return np.array([dI, dD], dtype=float)
+
+def diffuse_inflammation(x, t, p: Params):
+    # separate diffusion scales for I and D
+    return np.array([p.sigma_inflam, p.sigma_damage], dtype=float)
+
+
+# ----------------------------
+# Euler–Maruyama integrator (diagonal diffusion)
+# ----------------------------
+def em_step(x, drift, diffusion_diag, dt, rng):
+    """
+    x_{t+dt} = x_t + f(x,t) dt + g(x,t) dW
+    where g is diagonal and dW ~ N(0, dt)
+    """
+    dW = rng.normal(0.0, np.sqrt(dt), size=x.shape)
+    return x + drift * dt + diffusion_diag * dW
+
+
+# ----------------------------
+# Simulation runners
+# ----------------------------
+def simulate_coupled(p: Params, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    N = int(p.T / p.dt) + 1
+    ts = np.linspace(0.0, p.T, N)
+
+    # States
+    A = np.zeros((N, 3))  # [A_gut, P, B]
+    C = np.zeros((N, 3))  # [T_sys, T_entry, E]
+    G = np.zeros((N, 2))  # [G_brain, G_liver]
+    Nf = np.zeros((N, 2)) # [I, D]
+
+    # initial conditions
+    A[0] = np.array([0.0, 0.0, 0.0])
+    C[0] = np.array([0.0, 0.0, 0.0])
+    G[0] = np.array([1.2, 1.0])   # starting GM2 burden example
+    Nf[0] = np.array([0.3, 0.0])  # baseline inflammation
+
+    # helper: apply dosing impulses
+    dose_set = set([round(t, 6) for t in p.dose_times])
+    for i in range(1, N):
+        t = ts[i-1]
+
+        # impulses at step start
+        if round(t, 6) in dose_set:
+            A[i-1, 0] += p.dose_amt
+        if abs(t - p.aav_bolus_time) < 0.5 * p.dt:
+            C[i-1, 0] += p.aav_bolus_amt
+
+        # --- Anabolic step ---
+        fa = drift_anabolic(A[i-1], t, p)
+        ga = diffuse_anabolic(A[i-1], t, p)
+        A[i] = em_step(A[i-1], fa, ga, p.dt, rng)
+        A[i] = np.maximum(A[i], 0.0)
+
+        # --- Catabolic step ---
+        fc = drift_catabolic(C[i-1], t, p)
+        gc = diffuse_catabolic(C[i-1], t, p)
+        C[i] = em_step(C[i-1], fc, gc, p.dt, rng)
+        C[i] = np.maximum(C[i], 0.0)
+
+        B = A[i, 2]
+        E = C[i, 2]
+
+        # --- GM2 metabolism step (coupled to B and E) ---
+        fg = drift_gm2(G[i-1], t, p, B=B, E=E)
+        gg = diffuse_gm2(G[i-1], t, p)
+        G[i] = em_step(G[i-1], fg, gg, p.dt, rng)
+        G[i] = np.maximum(G[i], 0.0)
+
+        Gb = G[i, 0]
+
+        # --- Neuroinflammation step (coupled to Gb) ---
+        fn = drift_inflammation(Nf[i-1], t, p, Gb=Gb)
+        gn = diffuse_inflammation(Nf[i-1], t, p)
+        Nf[i] = em_step(Nf[i-1], fn, gn, p.dt, rng)
+        Nf[i] = np.maximum(Nf[i], 0.0)
+
+    return ts, A, C, G, Nf
+
+
+def simulate_anabolic_only(p: Params, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    N = int(p.T / p.dt) + 1
+    ts = np.linspace(0.0, p.T, N)
+    A = np.zeros((N, 3))
+    A[0] = np.array([0.0, 0.0, 0.0])
+
+    dose_set = set([round(t, 6) for t in p.dose_times])
+    for i in range(1, N):
+        t = ts[i-1]
+        if round(t, 6) in dose_set:
+            A[i-1, 0] += p.dose_amt
+        fa = drift_anabolic(A[i-1], t, p)
+        ga = diffuse_anabolic(A[i-1], t, p)
+        A[i] = em_step(A[i-1], fa, ga, p.dt, rng)
+        A[i] = np.maximum(A[i], 0.0)
+    return ts, A
+
+
+def simulate_catabolic_only(p: Params, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    N = int(p.T / p.dt) + 1
+    ts = np.linspace(0.0, p.T, N)
+    C = np.zeros((N, 3))
+    C[0] = np.array([0.0, 0.0, 0.0])
+
+    for i in range(1, N):
+        t = ts[i-1]
+        if abs(t - p.aav_bolus_time) < 0.5 * p.dt:
+            C[i-1, 0] += p.aav_bolus_amt
+        fc = drift_catabolic(C[i-1], t, p)
+        gc = diffuse_catabolic(C[i-1], t, p)
+        C[i] = em_step(C[i-1], fc, gc, p.dt, rng)
+        C[i] = np.maximum(C[i], 0.0)
+    return ts, C
+
+
+def simulate_inflammation_only(p: Params, seed: int = 0, Gb_const: float = 1.2):
+    rng = np.random.default_rng(seed)
+    N = int(p.T / p.dt) + 1
+    ts = np.linspace(0.0, p.T, N)
+    Nf = np.zeros((N, 2))
+    Nf[0] = np.array([0.3, 0.0])
+    for i in range(1, N):
+        t = ts[i-1]
+        fn = drift_inflammation(Nf[i-1], t, p, Gb=Gb_const)
+        gn = diffuse_inflammation(Nf[i-1], t, p)
+        Nf[i] = em_step(Nf[i-1], fn, gn, p.dt, rng)
+        Nf[i] = np.maximum(Nf[i], 0.0)
+    return ts, Nf
+
+
+# ----------------------------
+# Plot helpers (for your pathway figures)
+# ----------------------------
+def plot_pathway_anabolic(ts, A):
+    plt.figure()
+    plt.plot(ts, A[:, 0], label="A_gut")
+    plt.plot(ts, A[:, 1], label="P_plasma")
+    plt.plot(ts, A[:, 2], label="B_brain")
+    plt.xlabel("Time")
+    plt.ylabel("Concentration / amount (a.u.)")
+    plt.title("Anabolic Module: SP² PK (gut → plasma → brain)")
+    plt.legend()
+    plt.show()
+
+def plot_pathway_catabolic(ts, C):
+    plt.figure()
+    plt.plot(ts, C[:, 0], label="T_sys")
+    plt.plot(ts, C[:, 1], label="T_entry")
+    plt.plot(ts, C[:, 2], label="E_expr")
+    plt.xlabel("Time")
+    plt.ylabel("Vector / expression (a.u.)")
+    plt.title("Catabolic Module: AAV-T4 delivery → expression")
+    plt.legend()
+    plt.show()
+
+def plot_pathway_gm2(ts, G):
+    plt.figure()
+    plt.plot(ts, G[:, 0], label="G_brain")
+    plt.plot(ts, G[:, 1], label="G_liver")
+    plt.xlabel("Time")
+    plt.ylabel("GM2 burden (a.u.)")
+    plt.title("GM2 Metabolism: synthesis vs enzymatic clearance")
+    plt.legend()
+    plt.show()
+
+def plot_pathway_neuro(ts, Nf):
+    plt.figure()
+    plt.plot(ts, Nf[:, 0], label="Inflammation I")
+    plt.plot(ts, Nf[:, 1], label="Damage D")
+    plt.xlabel("Time")
+    plt.ylabel("Index (a.u.)")
+    plt.title("Neuroinflammatory Cascade: I(t) and D(t)")
+    plt.legend()
+    plt.show()
+
+def plot_coupled_summary(ts, A, C, G, Nf):
+    plt.figure()
+    plt.plot(ts, A[:, 2], label="B_brain (SP²)")
+    plt.plot(ts, C[:, 2], label="E_expr (HEXA/HEXB)")
+    plt.plot(ts, G[:, 0], label="G_brain (GM2)")
+    plt.plot(ts, Nf[:, 0], label="I (inflam)")
+    plt.xlabel("Time")
+    plt.ylabel("a.u.")
+    plt.title("Coupled System Summary: B → (G) ← E; G → I")
+    plt.legend()
+    plt.show()
+
+
+# ----------------------------
+# Example usage
+# ----------------------------
+if __name__ == "__main__":
+    p = Params()
+
+    # 1) Independent pathway simulations (for Figure 3A/3B/3C)
+    tsA, A = simulate_anabolic_only(p, seed=1)
+    plot_pathway_anabolic(tsA, A)
+
+    tsC, C = simulate_catabolic_only(p, seed=2)
+    plot_pathway_catabolic(tsC, C)
+
+    tsN, Nf = simulate_inflammation_only(p, seed=3, Gb_const=1.2)
+    plot_pathway_neuro(tsN, Nf)
+
+    # 2) Fully coupled simulation (for combined model figure)
+    ts, A2, C2, G2, Nf2 = simulate_coupled(p, seed=4)
+    plot_pathway_gm2(ts, G2)
+    plot_coupled_summary(ts, A2, C2, G2, Nf2)
