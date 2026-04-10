@@ -1,9 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ==============================
 # SIMULATION PARAMETERS
-# ==============================
 T = 365
 dt = 0.5
 n_steps = int(T / dt)
@@ -11,9 +9,7 @@ n_sims = 1000
 
 GM2_0 = 900.0  # pathological baseline (nmol/g)
 
-# ------------------------------
 # BIOLOGICAL CONSTANTS
-# ------------------------------
 k_synth = 0.7
 
 # Enzyme kinetics (critical fix)
@@ -35,9 +31,7 @@ floors = {
     "TRI": 180
 }
 
-# ==============================
 # GM2 MODEL (NONLINEAR & CONSTRAINED)
-# ==============================
 def simulate_GM2(mode):
     GM2 = np.zeros((n_sims, n_steps))
     GM2[:, 0] = GM2_0
@@ -70,18 +64,14 @@ def simulate_GM2(mode):
 
     return GM2
 
-# ==============================
 # RUN ALL ARMS
-# ==============================
 GM2_ERT      = simulate_GM2("ERT")
 GM2_SRT      = simulate_GM2("SRT")
 GM2_AAV      = simulate_GM2("AAV")
 GM2_AAV_SRT  = simulate_GM2("AAV_SRT")
 GM2_TRI      = simulate_GM2("TRI")
 
-# ==============================
 # PERCENT REDUCTION
-# ==============================
 def percent_reduction(GM2):
     return 100 * (GM2[:, 0] - GM2[:, -1]) / GM2[:, 0]
 
@@ -91,9 +81,7 @@ AAV = percent_reduction(GM2_AAV)
 AAV_SRT = percent_reduction(GM2_AAV_SRT)
 TRI = percent_reduction(GM2_TRI)
 
-# ==============================
 # PLOT (NOW CORRECT)
-# ==============================
 groups = [ERT, SRT, AAV, AAV_SRT, TRI]
 labels = [
     "ERT",
